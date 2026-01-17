@@ -1,181 +1,194 @@
-/** Contains a group of peers. */
-type Room = { id: string; peers: { id: string; info: any; socket?: WebSocket }[] };
+// Based on Maneuver's signaling server.
+// https://github.com/ShinyShips/Maneuver-2025/blob/main/netlify/functions/webrtc-signal.ts
 
-type RTCMessageType = 'offer' | 'answer' | 'ice-candidate';
+/** Grouping of peers and messages between peers. */
+type Room = {
+	id: string;
+	peers: { id: string; data: any; lastSeenAt: number }[];
+	messages: StorableMessage[];
+	createdAt: number;
+};
 
-/** A message created by a client, sent to this server. */
-type ClientMessage =
-	| { type: 'join'; roomId: string; peerId: string; peerInfo: any }
-	| { type: RTCMessageType; roomId: string; peerId: string; toPeerId: string; rtcData: any }
-	| { type: 'leave'; roomId: string; peerId: string }
+/** A message between peers that should persist in a room. */
+type StorableMessage =
+	| {
+			type: 'offer';
+			roomId: string;
+			peerId: string;
+			offer: any;
+			sendingTo?: string[] | undefined;
+			deliveredTo?: string[] | undefined;
+	  }
+	| {
+			type: 'answer';
+			roomId: string;
+			peerId: string;
+			answer: any;
+			sendingTo?: string[] | undefined;
+			deliveredTo?: string[] | undefined;
+	  }
+	| {
+			type: 'ice-candidate';
+			roomId: string;
+			peerId: string;
+			candidate: any;
+			sendingTo?: string[] | undefined;
+			deliveredTo?: string[] | undefined;
+	  }
+	| {
+			type: 'join';
+			roomId: string;
+			peerId: string;
+			peerData: any;
+			sendingTo?: string[] | undefined;
+			deliveredTo?: string[] | undefined;
+	  };
+
+type SignalingMessage =
+	| StorableMessage
+	| {
+			type: 'leave';
+			roomId: string;
+			peerId: string;
+	  }
 	| { type: 'ping' };
 
-/** A message created by this server, to be sent to one or many peers. */
-type ServerMessage =
-	| { type: 'room-info'; roomId: string; peers: { id: string; info: any }[] }
-	| { type: 'peer-join'; peerId: string; peerInfo: any }
-	| { type: `peer-${RTCMessageType}`; peerId: string; data: any }
-	| { type: 'peer-leave'; peerId: string }
-	| { type: 'pong' }
-	| { type: 'error'; error: string };
+const corsHeaders: HeadersInit = {
+	'access-control-allow-origin': '*',
+	'access-control-allow-headers': 'content-type',
+	'access-control-allow-methods': 'OPTIONS, POST, GET',
+};
+
+const headers: HeadersInit = { ...corsHeaders, 'content-type': 'application/json' };
 
 const rooms = new Map<string, Room>();
+const ROOM_TIMEOUT_5_MINUTES = 30 * 60 * 1000 * 5;
 
 export default {
 	async fetch(request) {
-		if (request.headers.get('upgrade') === 'websocket') {
-			const client = handleWebSocket();
-			return new Response(null, { status: 101, webSocket: client });
+		if (request.method === 'OPTIONS') {
+			return new Response(null, {
+				status: 204,
+				headers: { ...corsHeaders, allow: 'OPTIONS, POST, GET' },
+			});
+		}
+
+		if (request.method === 'POST') {
+			return post(request);
+		}
+
+		if (request.method === 'GET') {
+			return get(request);
 		}
 
 		return new Response();
 	},
 
-	async scheduled() {
+	async scheduled(controller) {
 		for (const [roomId, room] of rooms.entries()) {
-			if (!room.peers.length) {
+			if (controller.scheduledTime - room.createdAt > ROOM_TIMEOUT_5_MINUTES) {
 				rooms.delete(roomId);
 			}
 		}
 	},
 } satisfies ExportedHandler<Env>;
 
-function handleWebSocket() {
-	let dataForThisSocket: { peerId: string; roomId: string } | undefined = undefined;
+/** Handles a message from a peer. */
+async function post(request: Request) {
+	const now = Date.now();
 
-	const [client, server] = Object.values(new WebSocketPair());
-	server.accept();
+	let message: SignalingMessage;
 
-	server.addEventListener('open', (event) => {
-		console.log('web socket server opened', event);
-	});
+	try {
+		message = await request.json();
+	} catch {
+		return new Response(JSON.stringify({ type: 'error', error: 'Invalid JSON' }), { status: 400, headers });
+	}
 
-	server.addEventListener('error', (event) => {
-		console.error('web socket server error', event);
-	});
+	if (message.type === 'ping') {
+		return new Response(JSON.stringify({ type: 'pong' }), { status: 200, headers });
+	}
 
-	server.addEventListener('close', (event) => {
-		console.log('web socket server closed', event);
+	if (!message.roomId || !message.peerId) {
+		return new Response(JSON.stringify({ type: 'error', error: 'roomId and peerId props are required' }), { status: 400, headers });
+	}
 
-		if (dataForThisSocket) {
-			let room = rooms.get(dataForThisSocket.roomId);
+	let room = rooms.get(message.roomId);
+	if (!room) {
+		room = { id: message.roomId, peers: [], messages: [], createdAt: now };
+		rooms.set(message.roomId, room);
+	}
 
-			if (room) {
-				handlePeerLeave(dataForThisSocket.peerId, room);
+	switch (message.type) {
+		case 'offer':
+		case 'answer':
+		case 'ice-candidate':
+			room.messages.push({ ...message, deliveredTo: [] });
+			break;
+		case 'join':
+			let existingPeer = room.peers.find((peer) => peer.id === message.peerId);
+			if (existingPeer) {
+				existingPeer.data = message.peerData;
+				existingPeer.lastSeenAt = now;
+			} else {
+				room.peers.push({ id: message.peerId, data: message.peerData, lastSeenAt: now });
 			}
-		}
+			room.messages.push({ ...message, deliveredTo: [] });
+			break;
+		case 'leave':
+			room.peers = room.peers.filter((peer) => peer.id !== message.peerId);
+			break;
+	}
 
-		dataForThisSocket = undefined;
-	});
-
-	server.addEventListener('message', async (event) => {
-		console.log('web socket server message', event);
-
-		let message: ClientMessage;
-
-		try {
-			message = await JSON.parse(event.data);
-		} catch {
-			server.send(JSON.stringify({ type: 'error', error: 'Invalid JSON' } satisfies ServerMessage));
-			return;
-		}
-
-		if (message.type === 'ping') {
-			server.send(JSON.stringify({ type: 'pong' } satisfies ServerMessage));
-			return;
-		}
-
-		if (!message.roomId) {
-			server.send(JSON.stringify({ type: 'error', error: 'roomId is required' } satisfies ServerMessage));
-			return;
-		}
-
-		if (!message.peerId) {
-			server.send(JSON.stringify({ type: 'error', error: 'peerId is required' } satisfies ServerMessage));
-			return;
-		}
-
-		if (dataForThisSocket && dataForThisSocket.peerId !== message.peerId) {
-			server.send(JSON.stringify({ type: 'error', error: 'peerId is different' } satisfies ServerMessage));
-			return;
-		}
-
-		if (dataForThisSocket && dataForThisSocket.roomId !== message.roomId) {
-			server.send(JSON.stringify({ type: 'error', error: 'roomId is different' } satisfies ServerMessage));
-			return;
-		}
-
-		let room = rooms.get(message.roomId);
-
-		if (!room) {
-			room = { id: message.roomId, peers: [] };
-			rooms.set(message.roomId, room);
-		}
-
-		if (!dataForThisSocket) {
-			dataForThisSocket = { peerId: message.peerId, roomId: message.roomId };
-		}
-
-		switch (message.type) {
-			case 'join':
-				let existingPeer = room.peers.find((peer) => peer.id === message.peerId);
-
-				if (existingPeer) {
-					existingPeer.info = message.peerInfo;
-					existingPeer.socket?.close();
-					existingPeer.socket = server;
-				} else {
-					room.peers.push({ id: message.peerId, info: message.peerInfo, socket: server });
-				}
-
-				for (const peer of room.peers) {
-					if (peer.id !== message.peerId) {
-						peer.socket?.send(
-							JSON.stringify({ type: 'peer-join', peerId: message.peerId, peerInfo: message.peerInfo } satisfies ServerMessage),
-						);
-					}
-				}
-
-				server.send(
-					JSON.stringify({
-						type: 'room-info',
-						roomId: room.id,
-						peers: room.peers.map((peer) => ({ ...peer, socket: undefined })),
-					} satisfies ServerMessage),
-				);
-
-				break;
-
-			case 'offer':
-			case 'answer':
-			case 'ice-candidate':
-				room.peers
-					.find((peer) => peer.id == message.toPeerId)
-					?.socket?.send(
-						JSON.stringify({ type: `peer-${message.type}`, peerId: message.peerId, data: message.rtcData } satisfies ServerMessage),
-					);
-
-				break;
-
-			case 'leave':
-				handlePeerLeave(message.peerId, room);
-				dataForThisSocket = undefined;
-				break;
-		}
-	});
-
-	return client;
+	return new Response(JSON.stringify({ type: 'room', room }), { status: 200, headers });
 }
 
-/** Removes a peer from a room. Either notifies other peers or deletes the now-empty room. */
-function handlePeerLeave(peerId: string, room: Room) {
-	room.peers = room.peers.filter((peer) => peer.id !== peerId);
+/** Handles a query for room data from a peer. */
+async function get(request: Request) {
+	const url = new URL(request.url);
 
-	if (room.peers.length) {
-		for (const peer of room.peers) {
-			peer.socket?.send(JSON.stringify({ type: 'peer-leave', peerId } satisfies ServerMessage));
-		}
-	} else {
-		rooms.delete(room.id);
+	const roomId = url.searchParams.get('roomId');
+	const peerId = url.searchParams.get('peerId');
+
+	if (!roomId || !peerId) {
+		return new Response(JSON.stringify({ type: 'error', error: 'roomId and peerId params are required' }), { status: 400, headers });
 	}
+
+	const room = rooms.get(roomId);
+
+	if (!room) {
+		const fakeRoom: Room = { id: roomId, peers: [], messages: [], createdAt: Date.now() };
+		return new Response(JSON.stringify({ type: 'room', room: fakeRoom }), { status: 200, headers });
+	}
+
+	/** Messages yet to be received by this peer. */
+	const messages = room.messages.filter((message) => {
+		const notAuthor = message.peerId !== peerId;
+		const isRecipient = message.sendingTo?.includes(peerId);
+		const notDelivered = !message.deliveredTo?.includes(peerId);
+		return notAuthor && isRecipient && notDelivered;
+	});
+
+	// Mark these messages as received by this peer.
+	messages.forEach((message) => {
+		if (!message.deliveredTo) {
+			message.deliveredTo = [];
+		}
+		message.deliveredTo.push(peerId);
+	});
+
+	room.messages = room.messages.filter((message) => {
+		if (!message.deliveredTo) {
+			return true;
+		}
+
+		if (message.type === 'join') {
+			const someNotDelivered = room.peers.some((peer) => !message.deliveredTo?.includes(peer.id));
+			return someNotDelivered;
+		}
+
+		return message.deliveredTo.length < (message.sendingTo?.length || 1);
+	});
+
+	return new Response(JSON.stringify({ type: 'room', room: { ...room, messages } }), { status: 200, headers });
 }
