@@ -11,7 +11,7 @@ type Room = {
 
 /** A message created by a client, to be sent to other clients. */
 type IncomingRtcMessage = {
-	type: 'offer' | 'answer' | 'candidate';
+	type: 'signal';
 	roomId: string;
 	peerId: string;
 	toPeerId: string;
@@ -73,6 +73,7 @@ async function post(request: Request) {
 
 	try {
 		message = await request.json();
+		console.log(message);
 	} catch {
 		return jsonResponse(400, { type: 'error', error: 'Invalid JSON' });
 	}
@@ -107,9 +108,7 @@ async function post(request: Request) {
 			}
 			messages = handleIncomingMessagesForClient(room, message.peerId);
 			return jsonResponse(200, { type: 'room', room: { ...room, messages } });
-		case 'offer':
-		case 'answer':
-		case 'candidate':
+		case 'signal':
 			if (existingPeer) {
 				existingPeer.lastUpdate = now;
 			}
