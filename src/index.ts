@@ -1,175 +1,203 @@
-// Based on Maneuver's HTTP-based signaling server.
-// https://github.com/ShinyShips/maneuver-core/blob/main/netlify/functions/webrtc-signal.ts
+import { DurableObject } from 'cloudflare:workers';
 
-/** Grouping of peers and messages between peers. */
-type Room = {
-	id: string;
-	peers: { id: string; info: any; lastUpdate: number }[];
-	messages: StoredRtcMessage[];
-	lastUpdate: number;
-};
+type ClientInfo = { id: string; name?: string; team?: string };
+type InboundMessage = { type: 'signal'; to: string; data: any } | { type: 'info'; info: ClientInfo };
+type OutboundMessage =
+	| { type: 'clients'; clients: ClientInfo[] }
+	| { type: 'info'; info: ClientInfo }
+	| { type: 'signal'; from: string; data: any }
+	| { type: 'leave'; id: string }
+	| { type: 'error'; error: string };
 
-/** A message created by a client, to be sent to other clients. */
-type IncomingRtcMessage = {
-	type: 'signal';
-	roomId: string;
-	peerId: string;
-	toPeerId: string;
-	data: any;
-	delivered?: boolean | undefined;
-};
-
-/** Excludes redundant room id. */
-type StoredRtcMessage = Omit<IncomingRtcMessage, 'roomId'>;
-
-/** A message created by a client, sent to this server. */
-type ClientMessage =
-	| IncomingRtcMessage
-	| { type: 'join'; roomId: string; peerId: string; peerInfo: any }
-	| { type: 'leave'; roomId: string; peerId: string };
-
-/** A message created by this server, to be sent to a client. */
-type ServerMessage = { type: 'room'; room: Room } | { type: 'error'; error: string };
-
-const corsHeaders: HeadersInit = {
-	'access-control-allow-origin': '*',
-	'access-control-allow-headers': 'content-type',
-	'access-control-allow-methods': 'OPTIONS, POST, GET',
-};
-
-const headers: HeadersInit = { ...corsHeaders, 'content-type': 'application/json' };
-
-const rooms = new Map<string, Room>();
-const ROOM_TIMEOUT_5_MINUTES = 1000 * 60 * 5;
+const MAX_NAME_LENGTH = 32;
+const MAX_TEAM_LENGTH = 6;
 
 export default {
-	async fetch(request) {
-		switch (request.method) {
-			case 'OPTIONS':
-				return new Response(null, { status: 204, headers: { ...corsHeaders, allow: 'OPTIONS, POST, GET' } });
-			case 'POST':
-				return post(request);
-			case 'GET':
-				return get(request);
-			default:
-				return new Response(null, { status: 405, headers: { ...corsHeaders, allow: 'OPTIONS, POST, GET' } });
-		}
-	},
+	async fetch(request, env) {
+		const upgradeHeader = request.headers.get('Upgrade');
 
-	async scheduled(controller) {
-		for (const [roomId, room] of rooms.entries()) {
-			if (controller.scheduledTime - room.lastUpdate > ROOM_TIMEOUT_5_MINUTES) {
-				rooms.delete(roomId);
-			}
+		if (!upgradeHeader || upgradeHeader !== 'websocket') {
+			return new Response('Worker expected Upgrade: websocket', { status: 426 });
 		}
+
+		if (request.method !== 'GET') {
+			return new Response('Worker expected GET method', { status: 400 });
+		}
+
+		const params = new URL(request.url).searchParams;
+		const room = params.get('room') || undefined;
+		const name = params.get('name') || undefined;
+		const team = params.get('team') || undefined;
+
+		if (name && name.length > MAX_NAME_LENGTH) {
+			return new Response(`Name is too long (>${MAX_NAME_LENGTH} characters)`, { status: 400 });
+		}
+
+		if (team && team.length > MAX_TEAM_LENGTH) {
+			return new Response(`Team is too long (>${MAX_TEAM_LENGTH} characters)`, { status: 400 });
+		}
+
+		const stub = env.rooms.getByName(room || 'public');
+		return stub.fetch(request);
 	},
 } satisfies ExportedHandler<Env>;
 
-/** Handles a message from a peer. */
-async function post(request: Request) {
-	const now = Date.now();
+export class Room extends DurableObject<Env> {
+	clients: Map<WebSocket, ClientInfo>;
 
-	let message: ClientMessage;
+	constructor(ctx: DurableObjectState, env: Env) {
+		super(ctx, env);
+		this.clients = new Map();
 
-	try {
-		message = await request.json();
-		console.log(message);
-	} catch {
-		return jsonResponse(400, { type: 'error', error: 'Invalid JSON' });
+		for (const webSocket of this.ctx.getWebSockets()) {
+			const peerInfo = webSocket.deserializeAttachment();
+			if (!peerInfo) continue;
+			this.clients.set(webSocket, peerInfo);
+		}
+
+		this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'));
 	}
 
-	if (!message.roomId) {
-		return jsonResponse(400, { type: 'error', error: 'Missing roomId' });
+	fetch(request: Request) {
+		const params = new URL(request.url).searchParams;
+		const name = params.get('name') || undefined;
+		const team = params.get('team') || undefined;
+
+		const [socketForClient, socketForServer] = Object.values(new WebSocketPair());
+		this.ctx.acceptWebSocket(socketForServer);
+
+		const info: ClientInfo = { id: crypto.randomUUID(), name, team };
+		socketForServer.serializeAttachment(info);
+		this.clients.set(socketForServer, info);
+
+		this.sendTo(socketForServer, { type: 'clients', clients: Array.from(this.clients.values()) });
+		this.sendToAllExcept(socketForServer, { type: 'info', info });
+		return new Response(null, { status: 101, webSocket: socketForClient });
 	}
 
-	if (!message.peerId) {
-		return jsonResponse(400, { type: 'error', error: 'Missing peerId' });
-	}
+	webSocketMessage(webSocket: WebSocket, rawMessage: string | ArrayBuffer) {
+		if (typeof rawMessage !== 'string') {
+			this.sendTo(webSocket, { type: 'error', error: 'Invalid message' });
+			return;
+		}
 
-	let room = rooms.get(message.roomId);
-	if (!room) {
-		room = { id: message.roomId, peers: [], messages: [], lastUpdate: now };
-		rooms.set(message.roomId, room);
-	}
+		let message: InboundMessage;
 
-	room.lastUpdate = now;
+		try {
+			message = JSON.parse(rawMessage);
+		} catch (err) {
+			this.sendTo(webSocket, { type: 'error', error: 'Message could not be parsed' });
+			return;
+		}
 
-	let existingPeer = room.peers.find((peer) => peer.id === message.peerId);
+		if (typeof message !== 'object') {
+			this.sendTo(webSocket, { type: 'error', error: 'Invalid message' });
+			return;
+		}
 
-	let messages: StoredRtcMessage[];
+		if (!message.type) {
+			this.sendTo(webSocket, { type: 'error', error: 'Missing message "type" prop' });
+			return;
+		}
 
-	switch (message.type) {
-		case 'join':
-			if (existingPeer) {
-				existingPeer.info = message.peerInfo;
-				existingPeer.lastUpdate = now;
-			} else {
-				room.peers.push({ id: message.peerId, info: message.peerInfo, lastUpdate: now });
+		let clientInfo = this.clients.get(webSocket);
+
+		if (!clientInfo) {
+			if (message.type !== 'info') {
+				this.sendTo(webSocket, { type: 'error', error: 'Connection has no corresponding client info' });
+				return;
 			}
-			messages = handleIncomingMessagesForClient(room, message.peerId);
-			return jsonResponse(200, { type: 'room', room: { ...room, messages } });
-		case 'signal':
-			if (existingPeer) {
-				existingPeer.lastUpdate = now;
-			}
-			room.messages.push({ type: message.type, peerId: message.peerId, toPeerId: message.toPeerId, data: message.data });
-			messages = handleIncomingMessagesForClient(room, message.peerId);
-			return jsonResponse(200, { type: 'room', room: { ...room, messages } });
-		case 'leave':
-			room.peers = room.peers.filter((peer) => peer.id !== message.peerId);
-			room.messages = room.messages.filter((msg) => msg.peerId !== message.peerId && msg.toPeerId !== message.peerId);
-			return new Response(null, { status: 200, headers: corsHeaders });
+
+			clientInfo = {
+				id: message.info.id.toString().trim(),
+				name: message.info.name?.toString().trim(),
+				team: message.info.team?.toString().trim(),
+			};
+
+			this.clients.set(webSocket, clientInfo);
+			this.sendToAllExcept(webSocket, { type: 'info', info: clientInfo });
+		}
+
+		switch (message.type) {
+			case 'signal':
+				if (!message.to) {
+					this.sendTo(webSocket, { type: 'error', error: 'Missing message "to" prop' });
+					return;
+				}
+
+				for (const [otherWebSocket, otherClientInfo] of this.clients) {
+					if (message.to !== otherClientInfo.id) continue;
+					this.sendTo(otherWebSocket, { type: 'signal', from: clientInfo.id, data: message.data });
+					return;
+				}
+
+				this.sendTo(webSocket, { type: 'error', error: 'Client not found with that id' });
+				return;
+
+			case 'info':
+				if (!message.info) {
+					this.sendTo(webSocket, { type: 'error', error: 'Missing message "info" prop' });
+					return;
+				}
+
+				if (message.info.id !== clientInfo.id) {
+					this.sendTo(webSocket, { type: 'error', error: 'Mismatching ids' });
+					return;
+				}
+
+				const info: ClientInfo = {
+					id: clientInfo.id,
+					name: message.info.name?.toString().trim(),
+					team: message.info.team?.toString().trim(),
+				};
+
+				if (info.name && info.name.length > MAX_NAME_LENGTH) {
+					this.sendTo(webSocket, { type: 'error', error: `Name is too long (>${MAX_NAME_LENGTH} characters)` });
+					return;
+				}
+
+				if (info.team && info.team.length > MAX_TEAM_LENGTH) {
+					this.sendTo(webSocket, { type: 'error', error: `Team is too long (>${MAX_TEAM_LENGTH} characters)` });
+					return;
+				}
+
+				this.clients.set(webSocket, info);
+				this.sendToAllExcept(webSocket, { type: 'info', info });
+				return;
+
+			default:
+				this.sendTo(webSocket, { type: 'error', error: 'Invalid message type' });
+				return;
+		}
 	}
-}
 
-/** Handles a query for room data from a peer. */
-async function get(request: Request) {
-	const now = Date.now();
-	const url = new URL(request.url);
+	webSocketClose(webSocket: WebSocket, code: number, reason: string, wasClean: boolean) {
+		const clientInfo = this.clients.get(webSocket);
+		this.clients.delete(webSocket);
 
-	const roomId = url.searchParams.get('roomId');
-	if (!roomId) {
-		return jsonResponse(400, { type: 'error', error: 'Missing roomId' });
+		if (clientInfo) {
+			this.sendToAll({ type: 'leave', id: clientInfo.id });
+			webSocket.close(code, `Closing WebSocket for id ${clientInfo.id}, wasClean: ${wasClean}, reason: ${reason}`);
+		} else {
+			this.sendToAll({ type: 'clients', clients: Array.from(this.clients.values()) });
+			webSocket.close(code, `Closing WebSocket, wasClean: ${wasClean}, reason: ${reason}`);
+		}
 	}
 
-	const peerId = url.searchParams.get('peerId');
-	if (!peerId) {
-		return jsonResponse(400, { type: 'error', error: 'Missing peerId' });
+	sendTo(webSocket: WebSocket, message: OutboundMessage) {
+		webSocket.send(JSON.stringify(message));
 	}
 
-	const room = rooms.get(roomId);
-	if (!room) {
-		const fakeRoom: Room = { id: roomId, peers: [], messages: [], lastUpdate: now };
-		return jsonResponse(200, { type: 'room', room: fakeRoom });
+	sendToAll(message: OutboundMessage) {
+		for (const [webSocket] of this.clients) {
+			webSocket.send(JSON.stringify(message));
+		}
 	}
 
-	room.lastUpdate = now;
-
-	let existingPeer = room.peers.find((peer) => peer.id === peerId);
-	if (existingPeer) {
-		existingPeer.lastUpdate = Date.now();
+	sendToAllExcept(except: WebSocket, message: OutboundMessage) {
+		for (const [otherWebSocket] of this.clients) {
+			if (except === otherWebSocket) continue;
+			otherWebSocket.send(JSON.stringify(message));
+		}
 	}
-
-	/** Messages for this peer. */
-	const messages = handleIncomingMessagesForClient(room, peerId);
-	return jsonResponse(200, { type: 'room', room: { ...room, messages } });
-}
-
-function handleIncomingMessagesForClient(room: Room, peerId: string) {
-	/** Messages yet to be received by this peer. */
-	const messages = room.messages.filter((msg) => msg.peerId !== peerId && msg.toPeerId === peerId && !msg.delivered);
-
-	// Mark these messages as received by this peer.
-	for (const msg of messages) {
-		msg.delivered = true;
-	}
-
-	// Clean up fully delivered messages.
-	room.messages = room.messages.filter((msg) => !msg.delivered);
-
-	return messages;
-}
-
-function jsonResponse(status: number, message: ServerMessage) {
-	return new Response(JSON.stringify(message), { status, headers });
 }

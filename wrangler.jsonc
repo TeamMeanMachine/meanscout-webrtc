@@ -10,11 +10,27 @@
 	"observability": {
 		"enabled": true
 	},
-	"triggers": {
-		"crons": [
-			"*/5 * * * *"
+	// "triggers": {
+	// 	"crons": [
+	// 		"*/5 * * * *"
+	// 	]
+	// },
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "rooms",
+				"class_name": "Room"
+			}
 		]
-	}
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": [
+				"Room"
+			]
+		}
+	]
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
