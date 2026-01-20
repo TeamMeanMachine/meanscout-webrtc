@@ -3,6 +3,7 @@ import { DurableObject } from 'cloudflare:workers';
 type ClientInfo = { id: string; name?: string; team?: string };
 type InboundMessage = { type: 'signal'; to: string; data: any } | { type: 'info'; info: ClientInfo };
 type OutboundMessage =
+	| { type: 'join'; id: string; clients: ClientInfo[] }
 	| { type: 'clients'; clients: ClientInfo[] }
 	| { type: 'info'; info: ClientInfo }
 	| { type: 'signal'; from: string; data: any }
@@ -70,7 +71,7 @@ export class Room extends DurableObject<Env> {
 		socketForServer.serializeAttachment(info);
 		this.clients.set(socketForServer, info);
 
-		this.sendTo(socketForServer, { type: 'clients', clients: Array.from(this.clients.values()) });
+		this.sendTo(socketForServer, { type: 'join', id: info.id, clients: Array.from(this.clients.values()) });
 		this.sendToAllExcept(socketForServer, { type: 'info', info });
 		return new Response(null, { status: 101, webSocket: socketForClient });
 	}
