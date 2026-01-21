@@ -1,7 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 
 type ClientInfo = { id: string; name?: string; team?: string };
-type InboundMessage = { type: 'signal'; to: string; data: any } | { type: 'info'; info: ClientInfo };
+type InboundMessage = { type: 'signal'; to: string; data: any } | { type: 'info'; info: ClientInfo } | { type: 'leave'; id: string };
 type OutboundMessage =
 	| { type: 'join'; id: string; clients: ClientInfo[] }
 	| { type: 'clients'; clients: ClientInfo[] }
@@ -104,19 +104,8 @@ export class Room extends DurableObject<Env> {
 		let clientInfo = this.clients.get(webSocket);
 
 		if (!clientInfo) {
-			if (message.type !== 'info') {
-				this.sendTo(webSocket, { type: 'error', error: 'Connection has no corresponding client info' });
-				return;
-			}
-
-			clientInfo = {
-				id: message.info.id.toString().trim(),
-				name: message.info.name?.toString().trim(),
-				team: message.info.team?.toString().trim(),
-			};
-
-			this.clients.set(webSocket, clientInfo);
-			this.sendToAllExcept(webSocket, { type: 'info', info: clientInfo });
+			this.sendTo(webSocket, { type: 'error', error: 'Connection has no corresponding client info' });
+			return;
 		}
 
 		switch (message.type) {
@@ -166,39 +155,64 @@ export class Room extends DurableObject<Env> {
 				this.sendToAllExcept(webSocket, { type: 'info', info });
 				return;
 
+			case 'leave':
+				if (!message.id) return;
+
+				this.clients.delete(webSocket);
+
+				if (clientInfo) {
+					this.sendToAll({ type: 'leave', id: clientInfo.id });
+				}
+
+				return;
+
 			default:
 				this.sendTo(webSocket, { type: 'error', error: 'Invalid message type' });
 				return;
 		}
 	}
 
-	webSocketClose(webSocket: WebSocket, code: number, reason: string, wasClean: boolean) {
+	webSocketClose(webSocket: WebSocket) {
 		const clientInfo = this.clients.get(webSocket);
 		this.clients.delete(webSocket);
 
 		if (clientInfo) {
 			this.sendToAll({ type: 'leave', id: clientInfo.id });
-			webSocket.close(code, `Closing WebSocket for id ${clientInfo.id}, wasClean: ${wasClean}, reason: ${reason}`);
-		} else {
-			this.sendToAll({ type: 'clients', clients: Array.from(this.clients.values()) });
-			webSocket.close(code, `Closing WebSocket, wasClean: ${wasClean}, reason: ${reason}`);
+			webSocket.close();
 		}
 	}
 
 	sendTo(webSocket: WebSocket, message: OutboundMessage) {
-		webSocket.send(JSON.stringify(message));
+		this.trySend(webSocket, message);
 	}
 
 	sendToAll(message: OutboundMessage) {
 		for (const [webSocket] of this.clients) {
-			webSocket.send(JSON.stringify(message));
+			this.trySend(webSocket, message);
 		}
 	}
 
 	sendToAllExcept(except: WebSocket, message: OutboundMessage) {
 		for (const [otherWebSocket] of this.clients) {
 			if (except === otherWebSocket) continue;
-			otherWebSocket.send(JSON.stringify(message));
+			this.trySend(otherWebSocket, message);
+		}
+	}
+
+	trySend(webSocket: WebSocket, message: OutboundMessage) {
+		try {
+			webSocket.send(JSON.stringify(message));
+		} catch (err) {
+			// Assume that this client isn't connected,
+			// so remove them and notify all remaining clients.
+			const clientInfo = this.clients.get(webSocket);
+			this.clients.delete(webSocket);
+
+			if (clientInfo) {
+				this.sendToAll({ type: 'leave', id: clientInfo.id });
+			} else {
+				this.sendToAll({ type: 'clients', clients: Array.from(this.clients.values()) });
+			}
 		}
 	}
 }
