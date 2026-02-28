@@ -1,14 +1,19 @@
 import { DurableObject } from 'cloudflare:workers';
 
 type ClientInfo = { id: string; name?: string; team?: string };
-type InboundMessage = { type: 'signal'; to: string; data: any } | { type: 'info'; info: ClientInfo } | { type: 'leave'; id: string };
+type InboundMessage =
+	| { type: 'signal'; to: string; data: any }
+	| { type: 'info'; info: ClientInfo }
+	| { type: 'leave'; id: string }
+	| { type: 'batch'; messages: Extract<InboundMessage, { type: 'signal' }>[] };
 type OutboundMessage =
 	| { type: 'join'; id: string; clients: ClientInfo[] }
 	| { type: 'clients'; clients: ClientInfo[] }
 	| { type: 'info'; info: ClientInfo }
 	| { type: 'signal'; from: string; data: any }
 	| { type: 'leave'; id: string }
-	| { type: 'error'; error: string };
+	| { type: 'error'; error: string }
+	| { type: 'batch'; messages: Extract<OutboundMessage, { type: 'signal' }>[] };
 
 const MAX_NAME_LENGTH = 32;
 const MAX_TEAM_LENGTH = 6;
@@ -162,6 +167,58 @@ export class Room extends DurableObject<Env> {
 
 				if (clientInfo) {
 					this.sendToAll({ type: 'leave', id: clientInfo.id });
+				}
+
+				return;
+
+			case 'batch':
+				if (!message.messages || !Array.isArray(message.messages)) {
+					this.sendTo(webSocket, { type: 'error', error: 'No batched messages' });
+					return;
+				}
+
+				const messagesPerRecipient = new Map<WebSocket, Extract<OutboundMessage, { type: 'signal' }>[]>();
+
+				for (const msg of message.messages) {
+					if (typeof msg !== 'object') {
+						this.sendTo(webSocket, { type: 'error', error: 'Invalid message in batch' });
+						return;
+					}
+
+					if (!msg.type) {
+						this.sendTo(webSocket, { type: 'error', error: 'Missing message "type" prop in batch' });
+						return;
+					}
+
+					if (msg.type !== 'signal') {
+						this.sendTo(webSocket, { type: 'error', error: 'Batched messages should be of type "signal"' });
+						return;
+					}
+
+					if (!msg.to) {
+						this.sendTo(webSocket, { type: 'error', error: 'Missing message "to" prop in batch' });
+						return;
+					}
+
+					for (const [otherWebSocket, otherClientInfo] of this.clients) {
+						if (msg.to !== otherClientInfo.id) continue;
+
+						// We should be on the one client that matches the id here.
+
+						const messagesForThisRecipient = messagesPerRecipient.get(otherWebSocket) || [];
+						messagesForThisRecipient.push({ type: 'signal', from: clientInfo.id, data: msg.data });
+
+						messagesPerRecipient.set(otherWebSocket, messagesForThisRecipient);
+					}
+				}
+
+				if (messagesPerRecipient.size == 0) {
+					this.sendTo(webSocket, { type: 'error', error: 'Client not found with matching id in batch' });
+					return;
+				}
+
+				for (const [otherWebSocket, messages] of messagesPerRecipient) {
+					this.sendTo(otherWebSocket, { type: 'batch', messages });
 				}
 
 				return;
