@@ -1,19 +1,27 @@
 import { DurableObject } from 'cloudflare:workers';
 
 type ClientInfo = { id: string; name?: string; team?: string };
+
+type InboundCandidateMessage = { type: 'candidate'; to: string; candidate: any };
 type InboundMessage =
-	| { type: 'signal'; to: string; data: any }
+	| { type: 'offer'; to: string; offer: any }
+	| { type: 'answer'; to: string; answer: any }
+	| InboundCandidateMessage
 	| { type: 'info'; info: ClientInfo }
-	| { type: 'leave'; id: string }
-	| { type: 'batch'; messages: Extract<InboundMessage, { type: 'signal' }>[] };
+	| { type: 'leave' }
+	| { type: 'batch'; messages: InboundCandidateMessage[] };
+
+type OutboundCandidateMessage = { type: 'candidate'; from: string; candidate: any };
 type OutboundMessage =
-	| { type: 'join'; id: string; clients: ClientInfo[] }
+	| { type: 'init'; id: string; clients: ClientInfo[] }
 	| { type: 'clients'; clients: ClientInfo[] }
 	| { type: 'info'; info: ClientInfo }
-	| { type: 'signal'; from: string; data: any }
+	| { type: 'offer'; from: string; offer: any }
+	| { type: 'answer'; from: string; answer: any }
+	| OutboundCandidateMessage
 	| { type: 'leave'; id: string }
 	| { type: 'error'; error: string }
-	| { type: 'batch'; messages: Extract<OutboundMessage, { type: 'signal' }>[] };
+	| { type: 'batch'; messages: OutboundCandidateMessage[] };
 
 const MAX_NAME_LENGTH = 32;
 const MAX_TEAM_LENGTH = 6;
@@ -31,9 +39,13 @@ export default {
 		}
 
 		const params = new URL(request.url).searchParams;
-		const room = params.get('room') || undefined;
-		const name = params.get('name') || undefined;
-		const team = params.get('team') || undefined;
+		const room = params.get('room');
+		const name = params.get('name');
+		const team = params.get('team');
+
+		if (!room) {
+			return new Response('No room', { status: 400 });
+		}
 
 		if (name && name.length > MAX_NAME_LENGTH) {
 			return new Response(`Name is too long (>${MAX_NAME_LENGTH} characters)`, { status: 400 });
@@ -43,7 +55,7 @@ export default {
 			return new Response(`Team is too long (>${MAX_TEAM_LENGTH} characters)`, { status: 400 });
 		}
 
-		const stub = env.rooms.getByName(room || 'public');
+		const stub = env.rooms.getByName(room);
 		return stub.fetch(request);
 	},
 } satisfies ExportedHandler<Env>;
@@ -56,27 +68,29 @@ export class Room extends DurableObject<Env> {
 		this.clients = new Map();
 
 		for (const webSocket of this.ctx.getWebSockets()) {
-			const peerInfo = webSocket.deserializeAttachment();
-			if (!peerInfo) continue;
-			this.clients.set(webSocket, peerInfo);
+			const client = webSocket.deserializeAttachment();
+			if (!client) continue;
+			this.clients.set(webSocket, client);
 		}
-
-		this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'));
 	}
 
+	// Only the Cloudflare Worker can access this Durable Object,
+	// so we don't have to validate params again.
 	fetch(request: Request) {
 		const params = new URL(request.url).searchParams;
 		const name = params.get('name') || undefined;
 		const team = params.get('team') || undefined;
 
+		const id = crypto.randomUUID();
+
 		const [socketForClient, socketForServer] = Object.values(new WebSocketPair());
 		this.ctx.acceptWebSocket(socketForServer);
 
-		const info: ClientInfo = { id: crypto.randomUUID(), name, team };
-		socketForServer.serializeAttachment(info);
+		const info: ClientInfo = { id, name, team };
 		this.clients.set(socketForServer, info);
+		socketForServer.serializeAttachment(info);
 
-		this.sendTo(socketForServer, { type: 'join', id: info.id, clients: Array.from(this.clients.values()) });
+		this.sendTo(socketForServer, { type: 'init', id, clients: Array.from(this.clients.values()) });
 		this.sendToAllExcept(socketForServer, { type: 'info', info });
 		return new Response(null, { status: 101, webSocket: socketForClient });
 	}
@@ -114,15 +128,24 @@ export class Room extends DurableObject<Env> {
 		}
 
 		switch (message.type) {
-			case 'signal':
+			case 'offer':
+			case 'answer':
+			case 'candidate':
 				if (!message.to) {
 					this.sendTo(webSocket, { type: 'error', error: 'Missing message "to" prop' });
 					return;
 				}
 
+				const relayedMessage: OutboundMessage =
+					message.type == 'offer'
+						? { type: 'offer', from: clientInfo.id, offer: message.offer }
+						: message.type == 'answer'
+							? { type: 'answer', from: clientInfo.id, answer: message.answer }
+							: { type: 'candidate', from: clientInfo.id, candidate: message.candidate };
+
 				for (const [otherWebSocket, otherClientInfo] of this.clients) {
 					if (message.to !== otherClientInfo.id) continue;
-					this.sendTo(otherWebSocket, { type: 'signal', from: clientInfo.id, data: message.data });
+					this.sendTo(otherWebSocket, relayedMessage);
 					return;
 				}
 
@@ -157,12 +180,11 @@ export class Room extends DurableObject<Env> {
 				}
 
 				this.clients.set(webSocket, info);
+				webSocket.serializeAttachment(info);
 				this.sendToAllExcept(webSocket, { type: 'info', info });
 				return;
 
 			case 'leave':
-				if (!message.id) return;
-
 				this.clients.delete(webSocket);
 
 				if (clientInfo) {
@@ -177,27 +199,27 @@ export class Room extends DurableObject<Env> {
 					return;
 				}
 
-				const messagesPerRecipient = new Map<WebSocket, Extract<OutboundMessage, { type: 'signal' }>[]>();
+				const messagesPerRecipient = new Map<WebSocket, Extract<OutboundMessage, { type: 'candidate' }>[]>();
 
 				for (const msg of message.messages) {
 					if (typeof msg !== 'object') {
 						this.sendTo(webSocket, { type: 'error', error: 'Invalid message in batch' });
-						return;
+						continue;
 					}
 
 					if (!msg.type) {
 						this.sendTo(webSocket, { type: 'error', error: 'Missing message "type" prop in batch' });
-						return;
+						continue;
 					}
 
-					if (msg.type !== 'signal') {
-						this.sendTo(webSocket, { type: 'error', error: 'Batched messages should be of type "signal"' });
-						return;
+					if (msg.type !== 'candidate') {
+						this.sendTo(webSocket, { type: 'error', error: 'Batched messages must be of type "candidate"' });
+						continue;
 					}
 
 					if (!msg.to) {
 						this.sendTo(webSocket, { type: 'error', error: 'Missing message "to" prop in batch' });
-						return;
+						continue;
 					}
 
 					for (const [otherWebSocket, otherClientInfo] of this.clients) {
@@ -206,7 +228,7 @@ export class Room extends DurableObject<Env> {
 						// We should be on the one client that matches the id here.
 
 						const messagesForThisRecipient = messagesPerRecipient.get(otherWebSocket) || [];
-						messagesForThisRecipient.push({ type: 'signal', from: clientInfo.id, data: msg.data });
+						messagesForThisRecipient.push({ type: 'candidate', from: clientInfo.id, candidate: msg.candidate });
 
 						messagesPerRecipient.set(otherWebSocket, messagesForThisRecipient);
 					}
