@@ -7,7 +7,7 @@ type InboundMessage =
 	| { type: 'offer'; to: string; offer: any }
 	| { type: 'answer'; to: string; answer: any }
 	| InboundCandidateMessage
-	| { type: 'info'; info: ClientInfo }
+	| { type: 'info'; info: { name?: string; team?: string } }
 	| { type: 'leave' }
 	| { type: 'batch'; messages: InboundCandidateMessage[] };
 
@@ -155,11 +155,6 @@ export class Room extends DurableObject<Env> {
 			case 'info':
 				if (!message.info) {
 					this.sendTo(webSocket, { type: 'error', error: 'Missing message "info" prop' });
-					return;
-				}
-
-				if (message.info.id !== clientInfo.id) {
-					this.sendTo(webSocket, { type: 'error', error: 'Mismatching ids' });
 					return;
 				}
 
