@@ -2,6 +2,12 @@ import { DurableObject } from 'cloudflare:workers';
 
 type ClientInfo = { id: string; name?: string; team?: string };
 
+type ScoutingStatus = {
+	team: string;
+	match?: { number: number; set?: number | undefined; level?: 'qm' | 'ef' | 'qf' | 'sf' | 'f' | undefined } | undefined;
+	prediction?: 'red' | 'blue' | undefined;
+};
+
 type InboundCandidateMessage = { type: 'candidate'; to: string; candidate: any };
 type InboundMessage =
 	| { type: 'offer'; to: string; offer: any }
@@ -9,7 +15,10 @@ type InboundMessage =
 	| InboundCandidateMessage
 	| { type: 'info'; info: { name?: string; team?: string } }
 	| { type: 'leave' }
-	| { type: 'batch'; messages: InboundCandidateMessage[] };
+	| { type: 'batch'; messages: InboundCandidateMessage[] }
+	| { type: 'request'; to?: string[]; request: 'entries' | 'configs' | 'all' }
+	| { type: 'response'; to?: string[]; comps: any; surveys: any; fields: any; entries: any }
+	| { type: 'scouting'; status: 'done' | ScoutingStatus };
 
 type OutboundCandidateMessage = { type: 'candidate'; from: string; candidate: any };
 type OutboundMessage =
@@ -21,7 +30,10 @@ type OutboundMessage =
 	| OutboundCandidateMessage
 	| { type: 'leave'; id: string }
 	| { type: 'error'; error: string }
-	| { type: 'batch'; messages: OutboundCandidateMessage[] };
+	| { type: 'batch'; messages: OutboundCandidateMessage[] }
+	| { type: 'request'; from: string; request: 'entries' | 'configs' | 'all' }
+	| { type: 'response'; from: string; comps: any; surveys: any; fields: any; entries: any }
+	| { type: 'scouting'; from: string; status: 'done' | ScoutingStatus };
 
 const MAX_NAME_LENGTH = 32;
 const MAX_TEAM_LENGTH = 6;
@@ -127,6 +139,8 @@ export class Room extends DurableObject<Env> {
 			return;
 		}
 
+		let relayedMessage: OutboundMessage;
+
 		switch (message.type) {
 			case 'offer':
 			case 'answer':
@@ -136,7 +150,7 @@ export class Room extends DurableObject<Env> {
 					return;
 				}
 
-				const relayedMessage: OutboundMessage =
+				relayedMessage =
 					message.type == 'offer'
 						? { type: 'offer', from: clientInfo.id, offer: message.offer }
 						: message.type == 'answer'
@@ -238,6 +252,58 @@ export class Room extends DurableObject<Env> {
 					this.sendTo(otherWebSocket, { type: 'batch', messages });
 				}
 
+				return;
+
+			case 'request':
+				if (!['entries', 'configs', 'all'].includes(message.request)) {
+					this.sendTo(webSocket, { type: 'error', error: 'Invalid request type' });
+					return;
+				}
+
+				relayedMessage = { type: 'request', from: clientInfo.id, request: message.request };
+
+				if (message.to) {
+					for (const [otherWebSocket, otherClientInfo] of this.clients) {
+						if (message.to.includes(otherClientInfo.id)) {
+							this.sendTo(otherWebSocket, relayedMessage);
+						}
+					}
+				} else {
+					this.sendToAllExcept(webSocket, relayedMessage);
+				}
+
+				return;
+
+			case 'response':
+				relayedMessage = {
+					type: 'response',
+					from: clientInfo.id,
+					comps: message.comps,
+					surveys: message.surveys,
+					fields: message.fields,
+					entries: message.entries,
+				};
+
+				if (message.to) {
+					for (const [otherWebSocket, otherClientInfo] of this.clients) {
+						if (message.to.includes(otherClientInfo.id)) {
+							this.sendTo(otherWebSocket, relayedMessage);
+						}
+					}
+				} else {
+					this.sendToAllExcept(webSocket, relayedMessage);
+				}
+
+				return;
+
+			case 'scouting':
+				if (!message.status) {
+					this.sendTo(webSocket, { type: 'error', error: 'Invalid status' });
+					return;
+				}
+
+				relayedMessage = { type: 'scouting', from: clientInfo.id, status: message.status };
+				this.sendToAllExcept(webSocket, relayedMessage);
 				return;
 
 			default:
