@@ -2,12 +2,6 @@ import { DurableObject } from 'cloudflare:workers';
 
 type ClientInfo = { id: string; name?: string; team?: string };
 
-type ScoutingStatus = {
-	team: string;
-	match?: { number: number; set?: number | undefined; level?: 'qm' | 'ef' | 'qf' | 'sf' | 'f' | undefined } | undefined;
-	prediction?: 'red' | 'blue' | undefined;
-};
-
 type InboundCandidateMessage = { type: 'candidate'; to: string; candidate: any };
 type InboundMessage =
 	| { type: 'offer'; to: string; offer: any }
@@ -17,8 +11,8 @@ type InboundMessage =
 	| { type: 'leave' }
 	| { type: 'batch'; messages: InboundCandidateMessage[] }
 	| { type: 'request'; to?: string[]; request: 'entries' | 'configs' | 'all' }
-	| { type: 'response'; to?: string[]; comps: any; surveys: any; fields: any; entries: any }
-	| { type: 'scouting'; status: 'done' | ScoutingStatus };
+	| { type: 'response'; to?: string[]; data: any }
+	| { type: 'scouting'; status: any };
 
 type OutboundCandidateMessage = { type: 'candidate'; from: string; candidate: any };
 type OutboundMessage =
@@ -32,8 +26,8 @@ type OutboundMessage =
 	| { type: 'error'; error: string }
 	| { type: 'batch'; messages: OutboundCandidateMessage[] }
 	| { type: 'request'; from: string; request: 'entries' | 'configs' | 'all' }
-	| { type: 'response'; from: string; comps: any; surveys: any; fields: any; entries: any }
-	| { type: 'scouting'; from: string; status: 'done' | ScoutingStatus };
+	| { type: 'response'; from: string; data: any }
+	| { type: 'scouting'; from: string; status: any };
 
 const MAX_NAME_LENGTH = 32;
 const MAX_TEAM_LENGTH = 6;
@@ -275,14 +269,7 @@ export class Room extends DurableObject<Env> {
 				return;
 
 			case 'response':
-				relayedMessage = {
-					type: 'response',
-					from: clientInfo.id,
-					comps: message.comps,
-					surveys: message.surveys,
-					fields: message.fields,
-					entries: message.entries,
-				};
+				relayedMessage = { type: 'response', from: clientInfo.id, data: message.data };
 
 				if (message.to) {
 					for (const [otherWebSocket, otherClientInfo] of this.clients) {
